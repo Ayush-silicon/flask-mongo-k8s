@@ -33,6 +33,56 @@ Tools: Minikube, kubectl
 
 <img width="1388" height="753" alt="image" src="https://github.com/user-attachments/assets/8093f22d-7214-4414-9146-aa8e0b7b98bb" />
 
+### Components
+1. **Flask Application**: Web server with 2-5 replicas (autoscaled)
+2. **MongoDB**: StatefulSet with persistent storage and authentication
+3. **Services**: NodePort for Flask, ClusterIP for MongoDB
+4. **HPA**: Scales Flask pods based on 70% CPU usage
+
+### DNS Resolution in Kubernetes
+
+Kubernetes provides internal DNS resolution through CoreDNS:
+
+**How it works:**
+- Each Service gets a DNS name: `<service-name>.<namespace>.svc.cluster.local`
+- Pods can use short names within the same namespace: `mongodb-service`
+- DNS queries are resolved by CoreDNS running in kube-system namespace
+
+**In this project:**
+- Flask connects to MongoDB using: `mongodb://admin:password123@mongodb-service:27017/`
+- `mongodb-service` resolves to the MongoDB StatefulSet pods
+- This is configured in `flask-configmap.yaml`
+
+**DNS Resolution Flow:**
+1. Flask pod makes request to `mongodb-service`
+2. Pod's DNS resolver (at `/etc/resolv.conf`) forwards to CoreDNS
+3. CoreDNS looks up Service name in its records
+4. Returns ClusterIP of mongodb-service
+5. Kubernetes networking routes traffic to MongoDB pod
+
+### Resource Requests and Limits
+
+**Purpose:**
+- **Requests**: Guaranteed resources for scheduling. Kubernetes ensures node has these resources before placing pod.
+- **Limits**: Maximum resources pod can use. Prevents resource exhaustion.
+
+**Configuration (both Flask and MongoDB):**
+```yaml
+resources:
+  requests:
+    cpu: "200m"      # 0.2 CPU cores guaranteed
+    memory: "250Mi"  # 250 MB guaranteed
+  limits:
+    cpu: "500m"      # Max 0.5 CPU cores
+    memory: "500Mi"  # Max 500 MB
+```
+
+**Benefits:**
+- Prevents pods from consuming all node resources
+- Enables efficient bin-packing on nodes
+- HPA uses requests as baseline for scaling decisions
+- OOM killer uses limits to terminate excessive pods
+
 ---
 
 ## 🚀 Run Locally
@@ -77,76 +127,179 @@ docker push <your-dockerhub-username>/flask-app:latest
 
 ### 1. Start Minikube
 ```bash
-minikube start
+minikube start --driver=docker
+minikube addons enable metrics-server
 ```
-
-### 2. Apply MongoDB Resources
+### 2. Build Docker Image
 ```bash
-kubectl apply -f k8s/mongo-secret.yaml
-kubectl apply -f k8s/mongo-pvc.yaml
-kubectl apply -f k8s/mongo-statefulset.yaml
-kubectl apply -f k8s/mongo-service.yaml
+eval $(minikube docker-env)
+docker build -t flask-mongodb-app:v1 .
 ```
 
-### 3. Deploy Flask App
+### 3. Deploy to Kubernetes
 ```bash
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/flask-deployment.yaml
-kubectl apply -f k8s/flask-service.yaml
+cd k8s
+kubectl apply -f mongodb-secret.yaml
+kubectl apply -f mongodb-pv.yaml
+kubectl apply -f mongodb-pvc.yaml
+kubectl apply -f mongodb-statefulset.yaml
+kubectl apply -f mongodb-service.yaml
+kubectl wait --for=condition=ready pod -l app=mongodb --timeout=120s
+kubectl apply -f flask-configmap.yaml
+kubectl apply -f flask-deployment.yaml
+kubectl apply -f flask-service.yaml
+kubectl apply -f flask-hpa.yaml
 ```
-
-### 4. Enable Autoscaling
+### 4. Access Application
 ```bash
-kubectl apply -f k8s/hpa.yaml
+minikube service flask-service --url
+# Or
+kubectl port-forward service/flask-service 5000:5000
 ```
 
-### 5. Access Application
+## Testing Scenarios
+
+### 1. Basic Functionality Test
 ```bash
-minikube service flask-service
+# Test root endpoint
+curl http://$(minikube ip):30080/
+
+# Insert data
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"test":"data"}' http://$(minikube ip):30080/data
+
+# Retrieve data
+curl http://$(minikube ip):30080/data
 ```
 
----
+**Expected:** All endpoints respond correctly, data persists in MongoDB
 
-## 🌐 DNS Resolution in Kubernetes
-Kubernetes internal DNS resolves service names automatically.  
-Flask connects to MongoDB using:
-
-```
-mongodb://<user>:<password>@mongo-service:27017/
-```
-
-`mongo-service` is resolved by CoreDNS to the MongoDB Pod IP.
-
----
-
-## 📊 Resource Requests & Limits
-Example configuration:
-```yaml
-resources:
-  requests:
-    cpu: "0.2"
-    memory: "250Mi"
-  limits:
-    cpu: "0.5"
-    memory: "500Mi"
-```
-
----
-
-## 🔄 Autoscaling (HPA Testing)
-Simulate high load:
+### 2. Database Persistence Test
 ```bash
-kubectl run loadgen --image=busybox -- sh -c "while true; do wget -q -O- http://flask-service:5000; done"
+# Insert data
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"persistent":"test"}' http://$(minikube ip):30080/data
+
+# Delete MongoDB pod
+kubectl delete pod mongodb-0
+
+# Wait for recreation
+kubectl wait --for=condition=ready pod/mongodb-0 --timeout=120s
+
+# Verify data still exists
+curl http://$(minikube ip):30080/data
 ```
 
-HPA scales replicas from **2 → 5** when CPU > 70%.
+**Result:** ✅ Data persisted after pod deletion
+**Observation:** PVC ensures data survives pod restarts
 
----
+### 3. Autoscaling Test
+```bash
+# Deploy load generator
+kubectl apply -f load-test.yaml
 
-## 📸 Screenshots
-(Add screenshots of your app, terminal, and Kubernetes dashboard)
+# Monitor HPA
+kubectl get hpa --watch
 
----
+# Monitor pods
+kubectl get pods --watch
+
+# Check CPU usage
+kubectl top pods
+```
+
+**Results:**
+- Initial state: 2 replicas, ~10% CPU usage
+- Under load: CPU rose to ~85%
+- Scaling triggered: HPA created 3rd replica at 2min mark
+- Peak: 4 replicas at ~75% average CPU
+- Cool down: After stopping load, scaled down to 2 replicas in ~5min
+
+**Issues Encountered:**
+1. **Metrics not available initially**: Metrics-server addon wasn't enabled
+   - **Solution**: `minikube addons enable metrics-server`
+
+2. **HPA showed "unknown" CPU**: Pods didn't have resource requests defined
+   - **Solution**: Added resource requests to deployment
+
+3. **Slow scaling**: Default behavior has delays
+   - **Observation**: This is intentional to prevent flapping
+
+### 4. DNS Resolution Test
+```bash
+# Exec into Flask pod
+kubectl exec -it  -- /bin/sh
+
+# Install ping
+apk add --no-cache bind-tools
+
+# Test DNS resolution
+nslookup mongodb-service
+
+# Test connection
+nc -zv mongodb-service 27017
+```
+
+**Result:** ✅ DNS correctly resolves mongodb-service to ClusterIP
+
+### 5. Authentication Test
+```bash
+# Try connecting without auth (should fail)
+kubectl run -it --rm mongo-client --image=mongo:5.0 --restart=Never \
+  -- mongo mongodb-service:27017
+
+# Try with correct credentials (should succeed)
+kubectl run -it --rm mongo-client --image=mongo:5.0 --restart=Never \
+  -- mongo "mongodb://admin:password123@mongodb-service:27017"
+```
+
+**Result:** ✅ Authentication working correctly
+
+## Monitoring Commands
+```bash
+# View all resources
+kubectl get all
+
+# Check HPA status
+kubectl get hpa
+
+# View pod resource usage
+kubectl top pods
+
+# View pod logs
+kubectl logs -l app=flask-app --tail=50
+kubectl logs mongodb-0
+
+# Describe resources
+kubectl describe pod 
+kubectl describe hpa flask-hpa
+```
+## Cleanup
+```bash
+kubectl delete -f k8s/
+minikube stop
+minikube delete
+```
+
+## Troubleshooting
+
+### Pods not starting
+```bash
+kubectl describe pod 
+kubectl logs 
+```
+
+### MongoDB connection issues
+```bash
+kubectl logs -l app=flask-app | grep -i mongo
+kubectl exec -it mongodb-0 -- mongo -u admin -p password123
+```
+### HPA not working
+```bash
+kubectl get hpa
+kubectl top pods
+kubectl describe hpa flask-hpa
+```
 
 ## 🤝 Contribution Guidelines
 1. Fork the repository  
